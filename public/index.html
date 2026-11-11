@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>БУНКЕР</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="/socket.io/socket.io.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #14120f;
+    --panel: #1d1a15;
+    --panel-2: #262119;
+    --line: #3a3327;
+    --rust: #c1531c;
+    --rust-bright: #e2732f;
+    --sign: #e8c35a;
+    --text: #ece6d6;
+    --text-dim: #a89c85;
+    --danger: #a12c2c;
+    --ok: #4c7a4f;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0;
+    background: radial-gradient(1200px 800px at 50% -10%, #201b14 0%, var(--bg) 60%);
+    color: var(--text);
+    font-family: 'IBM Plex Mono', monospace;
+    min-height:100vh;
+  }
+  .font-head{ font-family:'Oswald',sans-serif; letter-spacing:.03em; }
+  .stripe-hazard{
+    background: repeating-linear-gradient(135deg, var(--rust) 0 14px, #14120f 14px 28px);
+  }
+  .panel{
+    background: var(--panel);
+    border: 1px solid var(--line);
+  }
+  .panel-2{ background: var(--panel-2); border: 1px solid var(--line); }
+  .btn{
+    font-family:'Oswald',sans-serif;
+    letter-spacing:.05em;
+    text-transform:uppercase;
+    font-weight:600;
+    transition: transform .1s ease, background-color .15s ease, border-color .15s ease;
+    border: 1px solid var(--line);
+  }
+  .btn:active{ transform: scale(0.97); }
+  .btn-primary{ background: var(--rust); border-color: var(--rust); color:#14120f; }
+  .btn-primary:hover{ background: var(--rust-bright); }
+  .btn-ghost{ background: transparent; color: var(--text); }
+  .btn-ghost:hover{ border-color: var(--sign); color: var(--sign); }
+  .btn:disabled{ opacity:.4; cursor:not-allowed; transform:none; }
+  .card-tile{
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+  }
+  .card-hidden{
+    background: repeating-linear-gradient(45deg, #211c15 0 8px, #191510 8px 16px);
+    border: 1px dashed var(--line);
+  }
+  ::-webkit-scrollbar{ width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb{ background: var(--line); border-radius:4px; }
+  .fade-in{ animation: fadeIn .25s ease both; }
+  @keyframes fadeIn{ from{opacity:0; transform: translateY(6px);} to{opacity:1; transform:none;} }
+  .pulse-dot{ animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse{ 0%,100%{opacity:.4;} 50%{opacity:1;} }
+  .glow-sign{ text-shadow: 0 0 18px rgba(232,195,90,0.25); }
+  @media (prefers-reduced-motion: reduce){
+    .fade-in, .pulse-dot{ animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<div id="app" class="max-w-3xl mx-auto min-h-screen flex flex-col"></div>
+
+<script>
+const socket = io();
+
+// Постійний ID гравця: зберігається в браузері, щоб після втрати зв'язку
+// (заснув телефон, перезавантажили сторінку) можна було повернутись у ту саму кімнату.
+function getPid(){
+  try{
+    let pid = localStorage.getItem("bunker_pid");
+    if(!pid){
+      pid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g,"")
+            : (Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2));
+      localStorage.setItem("bunker_pid", pid);
+    }
+    return pid;
+  }catch(e){
+    return Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  }
+}
+function saveRoomCode(code){ try{ localStorage.setItem("bunker_room", code); }catch(e){} }
+function clearRoomCode(){ try{ localStorage.removeItem("bunker_room"); }catch(e){} }
+
+const state = {
+  pid: getPid(),
+  online: true,
+  screen: "home",       // home | lobby | game | voting | round_result | finished
+  code: null,
+  nickname: localStorage.getItem("bunker_nick") || "",
+  room: null,            // останній room_update
+  myCards: null,         // { cards, revealed, categoryLabels, categoryOrder }
+  errorMsg: null,
+  isHost: false,
+};
+
+const app = document.getElementById("app");
+
+function esc(s){
+  const d = document.createElement("div");
+  d.textContent = s ?? "";
+  return d.innerHTML;
+}
+
+function setError(msg){
+  state.errorMsg = msg;
+  render();
+  if(msg){ setTimeout(()=>{ if(state.errorMsg===msg){ state.errorMsg=null; render(); } }, 4000); }
+}
+
+// ---------------- SOCKET EVENTS ----------------
+socket.on("room_update", (room) => {
+  state.room = room;
+  state.isHost = room.hostId === state.pid;
+  // Захисна синхронізація: власні розкриті картки завжди мають збігатись
+  // з публічним станом кімнати (на випадок затримки your_cards).
+  if(state.myCards){
+    const me = room.players.find(p => p.isYou);
+    if(me) state.myCards.revealed = me.revealed;
+  }
+  if(room.phase === "lobby") state.screen = "lobby";
+  else if(room.phase === "playing") state.screen = "game";
+  else if(room.phase === "voting") state.screen = "voting";
+  else if(room.phase === "round_result") state.screen = "round_result";
+  else if(room.phase === "finished") state.screen = "finished";
+  render();
+});
+
+socket.on("your_cards", (data) => {
+  state.myCards = data;
+  render();
+});
+
+socket.on("error_message", (msg) => setError(msg));
+
+socket.on("connect", () => {
+  state.online = true;
+  let saved = null;
+  try{ saved = localStorage.getItem("bunker_room"); }catch(e){}
+  if(saved){
+    // Пробуємо автоматично повернутись у свою кімнату (після перепідключення або перезавантаження)
+    socket.emit("rejoin", { code: saved, pid: state.pid }, (res) => {
+      if(res && res.ok){ state.code = res.code; }
+      else { clearRoomCode(); if(state.screen !== "home"){ state.code = null; state.room = null; state.myCards = null; state.screen = "home"; } render(); }
+    });
+  }
+  render();
+});
+
+socket.on("disconnect", () => {
+  state.online = false;
+  render();
+});
+
+// ---------------- ACTIONS ----------------
+function createRoom(){
+  const nickname = document.getElementById("in-nick").value.trim();
+  const seats = parseInt(document.getElementById("in-seats").value, 10) || 4;
+  if(!nickname) return setError("Введіть свій нікнейм.");
+  localStorage.setItem("bunker_nick", nickname);
+  socket.emit("create_room", { nickname, seats, pid: state.pid }, (res) => {
+    if(!res.ok) return setError(res.error);
+    state.code = res.code;
+    saveRoomCode(res.code);
+  });
+}
+
+function joinRoom(){
+  const nickname = document.getElementById("in-nick").value.trim();
+  const code = document.getElementById("in-code").value.trim().toUpperCase();
+  if(!nickname) return setError("Введіть свій нікнейм.");
+  if(!code) return setError("Введіть код кімнати.");
+  localStorage.setItem("bunker_nick", nickname);
+  socket.emit("join_room", { nickname, code, pid: state.pid }, (res) => {
+    if(!res.ok) return setError(res.error);
+    state.code = res.code;
+    saveRoomCode(res.code);
+  });
+}
+
+function startGame(){
+  socket.emit("start_game", { code: state.code });
+}
+
+function revealCard(category){
+  socket.emit("reveal_card", { code: state.code, category });
+}
+
+function startVoting(){
+  socket.emit("start_voting", { code: state.code });
+}
+
+function castVote(targetId){
+  socket.emit("cast_vote", { code: state.code, targetId });
+}
+
+function hostFinishVoting(){
+  socket.emit("host_finish_voting", { code: state.code });
+}
+
+function nextRound(){
+  socket.emit("next_round", { code: state.code });
+}
+
+function copyInvite(){
+  const url = `${location.origin}/?code=${state.code}`;
+  navigator.clipboard.writeText(url).then(()=>{
+    setError("Посилання скопійовано у буфер обміну ✔");
+  }).catch(()=>{
+    setError(url);
+  });
+}
+
+function leaveToHome(){
+  if(state.code) socket.emit("leave_room", { code: state.code });
+  clearRoomCode();
+  state.code = null; state.room = null; state.myCards = null; state.screen = "home";
+  render();
+}
+
+// ---------------- RENDER ----------------
+function render(){
+  app.innerHTML = "";
+  const el = document.createElement("div");
+  el.className = "flex-1 flex flex-col px-4 py-6 fade-in";
+
+  el.appendChild(header());
+  if(!state.online) el.appendChild(offlineBanner());
+  if(state.errorMsg) el.appendChild(errorBanner());
+
+  switch(state.screen){
+    case "home": el.appendChild(homeScreen()); break;
+    case "lobby": el.appendChild(lobbyScreen()); break;
+    case "game": el.appendChild(gameScreen()); break;
+    case "voting": el.appendChild(votingScreen()); break;
+    case "round_result": el.appendChild(roundResultScreen()); break;
+    case "finished": el.appendChild(finishedScreen()); break;
+  }
+
+  app.appendChild(el);
+  attachHandlers();
+}
+
+function header(){
+  const wrap = document.createElement("div");
+  wrap.className = "flex items-center justify-between mb-6";
+  wrap.innerHTML = `
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 stripe-hazard rounded-sm shrink-0"></div>
+      <div>
+        <div class="font-head text-2xl font-bold tracking-widest glow-sign" style="color:var(--sign)">БУНКЕР</div>
+        <div class="text-xs text-[color:var(--text-dim)] -mt-1">гра на виживання</div>
+      </div>
+    </div>
+    ${state.code ? `<div class="text-right">
+        <div class="text-xs text-[color:var(--text-dim)]">код кімнати</div>
+        <div class="font-head text-xl font-bold tracking-[0.2em]" style="color:var(--rust-bright)">${esc(state.code)}</div>
+      </div>` : ""}
+  `;
+  return wrap;
+}
+
+function offlineBanner(){
+  const d = document.createElement("div");
+  d.className = "panel border-l-4 mb-4 px-4 py-3 text-sm rounded-sm";
+  d.style.borderLeftColor = "var(--danger)";
+  d.innerHTML = `Зв'язок з сервером втрачено. Перепідключаємось<span class="pulse-dot">…</span>`;
+  return d;
+}
+
+function errorBanner(){
+  const d = document.createElement("div");
+  d.className = "panel border-l-4 mb-4 px-4 py-3 text-sm rounded-sm";
+  d.style.borderLeftColor = "var(--rust-bright)";
+  d.textContent = state.errorMsg;
+  return d;
+}
+
+function homeScreen(){
+  const params = new URLSearchParams(location.search);
+  const prefillCode = params.get("code") || "";
+  const d = document.createElement("div");
+  d.className = "flex flex-col gap-5";
+  d.innerHTML = `
+    <p class="text-[color:var(--text-dim)] text-sm leading-relaxed">
+      Катастрофа сталася. Місць у бункері бракує на всіх. Створіть кімнату для друзів
+      або приєднайтесь за кодом — і доведіть, що саме ви заслуговуєте на виживання.
+    </p>
+
+    <div class="panel rounded-sm p-4">
+      <label class="text-xs uppercase tracking-widest text-[color:var(--text-dim)]">Ваш нікнейм</label>
+      <input id="in-nick" maxlength="24" value="${esc(state.nickname)}" placeholder="Наприклад, Олег"
+        class="mt-2 w-full bg-transparent border-b border-[color:var(--line)] focus:border-[color:var(--sign)] outline-none py-2 text-lg" />
+    </div>
+
+    <div class="panel rounded-sm p-4">
+      <div class="font-head font-semibold uppercase tracking-wide mb-3" style="color:var(--sign)">Створити кімнату</div>
+      <label class="text-xs uppercase tracking-widest text-[color:var(--text-dim)]">Місць у бункері (скільки виживає)</label>
+      <input id="in-seats" type="number" min="1" max="19" value="4"
+        class="mt-2 w-full bg-transparent border-b border-[color:var(--line)] focus:border-[color:var(--sign)] outline-none py-2 text-lg" />
+      <button id="btn-create" class="btn btn-primary w-full mt-4 py-3 rounded-sm">Створити кімнату</button>
+    </div>
+
+    <div class="panel rounded-sm p-4">
+      <div class="font-head font-semibold uppercase tracking-wide mb-3" style="color:var(--sign)">Приєднатись</div>
+      <label class="text-xs uppercase tracking-widest text-[color:var(--text-dim)]">Код кімнати</label>
+      <input id="in-code" maxlength="5" value="${esc(prefillCode)}" placeholder="XXXXX"
+        class="mt-2 w-full bg-transparent border-b border-[color:var(--line)] focus:border-[color:var(--sign)] outline-none py-2 text-lg uppercase tracking-widest" />
+      <button id="btn-join" class="btn btn-ghost w-full mt-4 py-3 rounded-sm">Приєднатись до кімнати</button>
+    </div>
+  `;
+  return d;
+}
+
+function playersList(showVotes){
+  const wrap = document.createElement("div");
+  wrap.className = "flex flex-col gap-2";
+  state.room.players.forEach(p => {
+    const row = document.createElement("div");
+    row.className = `panel-2 rounded-sm px-3 py-2 flex items-center justify-between ${p.alive ? "" : "opacity-40"}`;
+    row.innerHTML = `
+      <div class="flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full ${p.alive ? "" : ""}" style="background:${p.alive ? "var(--ok)" : "var(--danger)"}"></span>
+        <span class="${p.isYou ? "font-semibold" : ""}">${esc(p.nickname)}${p.isYou ? " (ви)" : ""}</span>
+        ${p.isHost ? `<span class="text-[10px] px-1.5 py-0.5 rounded-sm" style="background:var(--rust);color:#14120f">ХОСТ</span>` : ""}
+        ${p.connected === false ? `<span class="text-[10px] text-[color:var(--text-dim)]">⚠ немає зв'язку</span>` : ""}
+        ${!p.alive ? `<span class="text-[10px] px-1.5 py-0.5 rounded-sm border border-[color:var(--danger)]" style="color:var(--danger)">ВИБУВ</span>` : ""}
+      </div>
+      ${showVotes && p.alive ? `<span class="text-xs text-[color:var(--text-dim)]">${p.hasVoted ? "проголосував ✔" : "думає…"}</span>` : ""}
+    `;
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+function lobbyScreen(){
+  const r = state.room;
+  const d = document.createElement("div");
+  d.className = "flex flex-col gap-5";
+
+  const inviteUrl = `${location.origin}/?code=${state.code}`;
+
+  d.innerHTML = `
+    <div class="panel rounded-sm p-4">
+      <div class="text-xs uppercase tracking-widest text-[color:var(--text-dim)] mb-1">Запросити друзів</div>
+      <div class="text-sm break-all text-[color:var(--sign)]">${esc(inviteUrl)}</div>
+      <button id="btn-copy" class="btn btn-ghost mt-3 px-4 py-2 rounded-sm text-xs">Скопіювати посилання</button>
+    </div>
+
+    <div>
+      <div class="font-head font-semibold uppercase tracking-wide mb-2" style="color:var(--sign)">
+        Гравці (${r.players.length})
+      </div>
+      <div id="players-slot"></div>
+    </div>
+
+    <div class="text-sm text-[color:var(--text-dim)]">
+      Місць у бункері: <span style="color:var(--rust-bright)">${r.settings.seats}</span> —
+      тобто ${r.players.length - r.settings.seats > 0 ? r.players.length - r.settings.seats : "?"} гравців мають вибути.
+    </div>
+
+    ${state.isHost
+      ? `<button id="btn-start" class="btn btn-primary w-full py-3 rounded-sm" ${r.players.length < 2 ? "disabled" : ""}>Почати гру</button>
+         ${r.players.length < 2 ? `<div class="text-xs text-center text-[color:var(--text-dim)]">Потрібно щонайменше 2 гравці</div>` : ""}`
+      : `<div class="panel-2 text-center py-3 rounded-sm text-sm text-[color:var(--text-dim)]">Очікуємо, поки хост почне гру<span class="pulse-dot">…</span></div>`
+    }
+
+    <button id="btn-leave" class="btn btn-ghost py-2 rounded-sm text-xs self-start">← Вийти з кімнати</button>
+  `;
+  d.querySelector("#players-slot").appendChild(playersList(false));
+  return d;
+}
+
+function categoryIcon(key){
+  const icons = {
+    profession: "🛠", health: "💊", ageGender: "🪪", hobby: "🎯",
+    phobia: "⚠️", baggage: "🎒", fact: "📄"
+  };
+  return icons[key] || "▫";
+}
+
+function scenarioPanel(){
+  const r = state.room;
+  const d = document.createElement("div");
+  d.className = "panel rounded-sm p-4 mb-4";
+  d.innerHTML = `
+    <div class="text-xs uppercase tracking-widest mb-1" style="color:var(--rust-bright)">Катастрофа</div>
+    <div class="text-sm mb-3">${esc(r.disaster)}</div>
+    <div class="text-xs uppercase tracking-widest mb-1" style="color:var(--rust-bright)">Бункер</div>
+    <div class="text-sm">${esc(r.bunker.description)}</div>
+    <div class="text-xs text-[color:var(--text-dim)] mt-1">${esc(r.bunker.supplies)} ${esc(r.bunker.size)}</div>
+  `;
+  return d;
+}
+
+function myCardsPanel(myTurn){
+  const mc = state.myCards;
+  if(!mc) return document.createElement("div");
+  const d = document.createElement("div");
+  d.className = "panel rounded-sm p-4 mb-4";
+  const title = document.createElement("div");
+  title.className = "font-head font-semibold uppercase tracking-wide mb-3";
+  title.style.color = "var(--sign)";
+  title.textContent = myTurn ? "Ваша черга — оберіть картку для розкриття" : "Ваші картки";
+  d.appendChild(title);
+
+  const grid = document.createElement("div");
+  grid.className = "grid grid-cols-1 sm:grid-cols-2 gap-2";
+  mc.categoryOrder.forEach(key => {
+    const isRevealed = !!mc.revealed[key];
+    const cell = document.createElement("div");
+    cell.className = `card-tile rounded-sm p-3 ${myTurn && !isRevealed ? "cursor-pointer hover:border-[color:var(--sign)]" : ""}`;
+    cell.innerHTML = `
+      <div class="text-xs text-[color:var(--text-dim)] flex items-center gap-1">
+        <span>${categoryIcon(key)}</span><span>${esc(mc.categoryLabels[key])}</span>
+      </div>
+      <div class="mt-1 text-sm ${isRevealed ? "" : ""}" style="${isRevealed ? "color:var(--text-dim)" : ""}">
+        ${esc(mc.cards[key])}
+      </div>
+      ${isRevealed ? `<div class="text-[10px] mt-1" style="color:var(--ok)">розкрито</div>`
+        : (myTurn ? `<div class="text-[10px] mt-1" style="color:var(--rust-bright)">натисніть, щоб розкрити</div>` : `<div class="text-[10px] mt-1 text-[color:var(--text-dim)]">приховано від інших</div>`)}
+    `;
+    if(myTurn && !isRevealed){
+      cell.addEventListener("click", () => revealCard(key));
+    }
+    grid.appendChild(cell);
+  });
+  d.appendChild(grid);
+  return d;
+}
+
+function otherPlayersBoard(){
+  const r = state.room;
+  const d = document.createElement("div");
+  d.innerHTML = `<div class="font-head font-semibold uppercase tracking-wide mb-2" style="color:var(--sign)">Учасники бункера</div>`;
+  const list = document.createElement("div");
+  list.className = "flex flex-col gap-3";
+
+  r.players.forEach(p => {
+    const box = document.createElement("div");
+    box.className = `panel-2 rounded-sm p-3 ${p.alive ? "" : "opacity-50"} ${r.turnPlayerId === p.id ? "border-2" : ""}`;
+    if(r.turnPlayerId === p.id) box.style.borderColor = "var(--rust-bright)";
+
+    let cardsHtml = "";
+    r.categoryOrder.forEach(key => {
+      const val = p.revealed[key];
+      cardsHtml += `
+        <div class="${val ? "card-tile" : "card-hidden"} rounded-sm px-2 py-1.5 text-xs">
+          <div class="text-[10px] text-[color:var(--text-dim)] flex items-center gap-1">
+            <span>${categoryIcon(key)}</span><span>${esc(r.categoryLabels[key])}</span>
+          </div>
+          <div class="mt-0.5">${val ? esc(val) : "?"}</div>
+        </div>
+      `;
+    });
+
+    box.innerHTML = `
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-2">
+          <span class="w-2 h-2 rounded-full" style="background:${p.alive ? "var(--ok)" : "var(--danger)"}"></span>
+          <span class="font-semibold ${p.isYou ? "" : ""}">${esc(p.nickname)}${p.isYou ? " (ви)" : ""}</span>
+          ${p.isHost ? `<span class="text-[10px] px-1.5 py-0.5 rounded-sm" style="background:var(--rust);color:#14120f">ХОСТ</span>` : ""}
+          ${r.turnPlayerId === p.id ? `<span class="text-[10px]" style="color:var(--rust-bright)">← ХІД</span>` : ""}
+          ${p.connected === false ? `<span class="text-[10px] text-[color:var(--text-dim)]">⚠ немає зв'язку</span>` : ""}
+        </div>
+        ${!p.alive ? `<span class="text-[10px]" style="color:var(--danger)">ВИБУВ</span>` : `<span class="text-[10px] text-[color:var(--text-dim)]">приховано: ${p.hiddenCount}</span>`}
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-1.5">${cardsHtml}</div>
+    `;
+    list.appendChild(box);
+  });
+
+  d.appendChild(list);
+  return d;
+}
+
+function gameScreen(){
+  const r = state.room;
+  const d = document.createElement("div");
+  d.className = "flex flex-col gap-1";
+
+  const roundBar = document.createElement("div");
+  roundBar.className = "flex items-center justify-between mb-3";
+  const myTurn = r.turnPlayerId === state.pid;
+  const turnPlayer = r.players.find(p => p.id === r.turnPlayerId);
+  roundBar.innerHTML = `
+    <div class="text-sm">Раунд <span class="font-semibold" style="color:var(--sign)">${r.round}</span></div>
+    <div class="text-sm">${myTurn ? `<span style="color:var(--rust-bright)">Ваша черга ходити</span>` : `Хід: <span style="color:var(--sign)">${esc(turnPlayer ? turnPlayer.nickname : "—")}</span>`}</div>
+  `;
+  d.appendChild(roundBar);
+
+  d.appendChild(scenarioPanel());
+  d.appendChild(myCardsPanel(myTurn));
+  d.appendChild(otherPlayersBoard());
+
+  if(state.isHost){
+    const btn = document.createElement("button");
+    btn.className = "btn btn-ghost w-full py-3 rounded-sm mt-4 text-xs";
+    btn.textContent = "Примусово почати голосування (пропустити хід тих, хто ще не ходив)";
+    btn.addEventListener("click", startVoting);
+    d.appendChild(btn);
+  }
+
+  return d;
+}
+
+function votingScreen(){
+  const r = state.room;
+  const d = document.createElement("div");
+  d.className = "flex flex-col gap-4";
+  const me = r.players.find(p => p.isYou);
+  const alreadyVoted = me ? me.hasVoted : false;
+
+  d.innerHTML = `
+    <div class="panel rounded-sm p-4">
+      <div class="font-head font-semibold uppercase tracking-wide mb-1" style="color:var(--rust-bright)">Фаза голосування</div>
+      <div class="text-sm text-[color:var(--text-dim)]">Оберіть, хто, на вашу думку, не повинен потрапити до бункера.</div>
+    </div>
+  `;
+
+  const list = document.createElement("div");
+  list.className = "flex flex-col gap-2";
+  r.players.filter(p => p.alive).forEach(p => {
+    const row = document.createElement("button");
+    const isSelf = p.isYou;
+    row.className = `panel-2 rounded-sm px-4 py-3 text-left flex items-center justify-between ${isSelf ? "opacity-40 cursor-not-allowed" : "hover:border-[color:var(--rust-bright)]"}`;
+    row.disabled = isSelf || alreadyVoted;
+    row.innerHTML = `
+      <span>${esc(p.nickname)}${isSelf ? " (ви)" : ""}</span>
+      <span class="text-xs text-[color:var(--text-dim)]">${p.hasVoted ? "проголосував ✔" : ""}</span>
+    `;
+    if(!isSelf && !alreadyVoted){
+      row.addEventListener("click", () => castVote(p.id));
+    }
+    list.appendChild(row);
+  });
+  d.appendChild(list);
+
+  if(alreadyVoted){
+    const wait = document.createElement("div");
+    wait.className = "panel-2 text-center py-3 rounded-sm text-sm text-[color:var(--text-dim)]";
+    wait.innerHTML = `Голос зараховано. Очікуємо на інших<span class="pulse-dot">…</span>`;
+    d.appendChild(wait);
+  }
+
+  if(state.isHost){
+    const btn = document.createElement("button");
+    btn.className = "btn btn-ghost w-full py-3 rounded-sm text-xs";
+    btn.textContent = "Примусово завершити голосування";
+    btn.addEventListener("click", hostFinishVoting);
+    d.appendChild(btn);
+  }
+
+  return d;
+}
+
+function roundResultScreen(){
+  const r = state.room;
+  const d = document.createElement("div");
+  d.className = "flex flex-col gap-4";
+
+  const elim = r.lastElimination;
+  const box = document.createElement("div");
+  box.className = "panel rounded-sm p-5 text-center";
+  if(elim && elim.id){
+    box.innerHTML = `
+      <div class="text-xs uppercase tracking-widest text-[color:var(--text-dim)] mb-2">${elim.tie ? "Нічия! Випадково вибуває:" : "За результатами голосування вибуває:"}</div>
+      <div class="font-head text-2xl font-bold" style="color:var(--danger)">${esc(elim.nickname)}</div>
+      <div class="text-xs text-[color:var(--text-dim)] mt-1">${elim.votes} голос(ів)</div>
+    `;
+  } else {
+    box.innerHTML = `<div class="text-sm text-[color:var(--text-dim)]">Голоси розподілились так, що ніхто не вибув.</div>`;
+  }
+  d.appendChild(box);
+
+  d.appendChild(otherPlayersBoard());
+
+  if(state.isHost){
+    const btn = document.createElement("button");
+    btn.className = "btn btn-primary w-full py-3 rounded-sm";
+    btn.textContent = "Наступний раунд";
+    btn.addEventListener("click", nextRound);
+    d.appendChild(btn);
+  } else {
+    const wait = document.createElement("div");
+    wait.className = "panel-2 text-center py-3 rounded-sm text-sm text-[color:var(--text-dim)]";
+    wait.innerHTML = `Очікуємо, поки хост почне наступний раунд<span class="pulse-dot">…</span>`;
+    d.appendChild(wait);
+  }
+
+  return d;
+}
+
+function finishedScreen(){
+  const r = state.room;
+  const survivors = r.players.filter(p => p.alive);
+  const d = document.createElement("div");
+  d.className = "flex flex-col gap-4";
+  d.innerHTML = `
+    <div class="panel rounded-sm p-5 text-center">
+      <div class="text-xs uppercase tracking-widest text-[color:var(--text-dim)] mb-2">Гру завершено</div>
+      <div class="font-head text-2xl font-bold glow-sign" style="color:var(--sign)">Двері бункера зачинено</div>
+      <div class="text-sm text-[color:var(--text-dim)] mt-1">Вижили ${survivors.length} із ${r.players.length}</div>
+    </div>
+  `;
+  const list = document.createElement("div");
+  list.className = "flex flex-col gap-2";
+  survivors.forEach(p => {
+    const row = document.createElement("div");
+    row.className = "panel-2 rounded-sm px-4 py-3";
+    row.innerHTML = `<span class="font-semibold" style="color:var(--ok)">✔ ${esc(p.nickname)}</span>`;
+    list.appendChild(row);
+  });
+  d.appendChild(list);
+
+  d.appendChild(otherPlayersBoard());
+
+  const btn = document.createElement("button");
+  btn.className = "btn btn-ghost w-full py-3 rounded-sm mt-2";
+  btn.textContent = "Вийти в головне меню";
+  btn.addEventListener("click", leaveToHome);
+  d.appendChild(btn);
+
+  return d;
+}
+
+// ---------------- HANDLERS BINDING ----------------
+function attachHandlers(){
+  const btnCreate = document.getElementById("btn-create");
+  if(btnCreate) btnCreate.addEventListener("click", createRoom);
+  const btnJoin = document.getElementById("btn-join");
+  if(btnJoin) btnJoin.addEventListener("click", joinRoom);
+  const btnCopy = document.getElementById("btn-copy");
+  if(btnCopy) btnCopy.addEventListener("click", copyInvite);
+  const btnStart = document.getElementById("btn-start");
+  if(btnStart) btnStart.addEventListener("click", startGame);
+  const btnLeave = document.getElementById("btn-leave");
+  if(btnLeave) btnLeave.addEventListener("click", leaveToHome);
+}
+
+render();
+</script>
+</body>
+</html>
